@@ -2,7 +2,7 @@ import logging
 from telegram import ForceReply, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from nhs_scraper import fetch_nhs_jobs
-from google_sheets import get_all_job_urls, get_user_chat_ids, add_user_chat_id, batch_update_jobs, get_most_recent_job
+from google_sheets import get_user_chat_ids, add_user_chat_id, batch_update_jobs, get_most_recent_job
 from datetime import datetime
 
 # Enable logging
@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 # Telegram Bot Token
 BOT_TOKEN = open('./secrets/telegram_bot_token.txt', 'r').read().strip()
+
+# Set DEBUG_MODE
+DEBUG_MODE = False  # Set this to False for production
 
 def format_date(date_str):
     date_obj = datetime.strptime(date_str, '%d/%m/%Y')
@@ -38,10 +41,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def check_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Checking for new jobs...")
     new_jobs = fetch_nhs_jobs()
-    batch_update_jobs(new_jobs)
-    existing_urls = set(get_all_job_urls())
-    
-    truly_new_jobs = [job for job in new_jobs if job['url'] not in existing_urls]
+    truly_new_jobs = batch_update_jobs(new_jobs)
     
     if truly_new_jobs:
         message = "🚨 New job postings found!\n\n"
@@ -50,14 +50,18 @@ async def check_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         user_chat_ids = get_user_chat_ids()
         for chat_id, is_debug in user_chat_ids:
-            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
+            if not DEBUG_MODE or (DEBUG_MODE and is_debug):
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
+    else:
+        logger.info("No new jobs were added to the sheet.")
     
-    most_recent_job = get_most_recent_job()
-    if most_recent_job:
-        debug_message = f"Most recent job scraped:\n{format_job_message(most_recent_job)}"
-        for chat_id, is_debug in get_user_chat_ids():
-            if is_debug:
-                await context.bot.send_message(chat_id=chat_id, text=debug_message, parse_mode='HTML')
+    if DEBUG_MODE:
+        most_recent_job = get_most_recent_job()
+        if most_recent_job:
+            debug_message = f"Most recent job in the sheet:\n{format_job_message(most_recent_job)}"
+            for chat_id, is_debug in get_user_chat_ids():
+                if is_debug:
+                    await context.bot.send_message(chat_id=chat_id, text=debug_message, parse_mode='HTML')
 
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Manually checking for new jobs...")

@@ -1,9 +1,13 @@
 import gspread
 from google.oauth2.service_account import Credentials
-import time
 from gspread.exceptions import APIError
 from ratelimit import limits, sleep_and_retry
 import json
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Set up the scope and credentials
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
@@ -20,7 +24,7 @@ with open('./secrets/sheet_ids.json', 'r') as f:
 JOB_SHEET_ID = sheet_ids['JOB_SHEET_ID']
 job_sheet = client.open_by_key(JOB_SHEET_ID).sheet1
 
-# Open a new Google Sheet for user chat IDs (create this sheet and replace with its ID)
+# Open a new Google Sheet for user chat IDs
 USER_SHEET_ID = sheet_ids['USER_SHEET_ID']
 user_sheet = client.open_by_key(USER_SHEET_ID).sheet1
 
@@ -51,29 +55,35 @@ def rate_limited_append_rows(worksheet, *args, **kwargs):
 def rate_limited_append_row(worksheet, *args, **kwargs):
     return worksheet.append_row(*args, **kwargs)
 
-# Cache job URLs to reduce read operations
-job_urls_cache = None
-last_cache_update = 0
-CACHE_EXPIRY = 300  # 5 minutes
-
 def ensure_header_row():
     if job_sheet.row_values(1) != HEADER_ROW:
         rate_limited_update(job_sheet, 'A1:I1', [HEADER_ROW])
 
-def get_all_job_urls():
-    global job_urls_cache, last_cache_update
-    current_time = time.time()
-    
-    if job_urls_cache is None or (current_time - last_cache_update) > CACHE_EXPIRY:
-        job_urls_cache = [row[1] for row in rate_limited_read(job_sheet)[1:]]
-        last_cache_update = current_time
-    
-    return job_urls_cache
+def get_all_jobs():
+    all_jobs = rate_limited_read(job_sheet)[1:]  # Skip the header row
+    return [
+        {
+            'title': job[0],
+            'url': job[1],
+            'employer': job[2],
+            'location': job[3],
+            'days_until_closing': job[4],
+            'salary': job[5],
+            'closing_date': job[6],
+            'posting_date': job[7],
+            'scraped_date': job[8]
+        }
+        for job in all_jobs
+    ]
 
 def batch_update_jobs(jobs):
     ensure_header_row()
-    existing_urls = set(get_all_job_urls())
+    existing_jobs = get_all_jobs()
+    existing_urls = set(job['url'] for job in existing_jobs)
     new_jobs = [job for job in jobs if job['url'] not in existing_urls]
+
+    logger.info(f"Total jobs received: {len(jobs)}")
+    logger.info(f"New jobs to add: {len(new_jobs)}")
 
     if new_jobs:
         job_data = [
@@ -89,34 +99,41 @@ def batch_update_jobs(jobs):
                 job['scraped_date']
             ] for job in new_jobs
         ]
-        rate_limited_append_rows(job_sheet, job_data)
+        try:
+            result = rate_limited_append_rows(job_sheet, job_data)
+            updated_rows = result.get('updates', {}).get('updatedRows', 0)
+            logger.info(f"Rows added: {updated_rows}")
+            if updated_rows == 0:
+                logger.warning("No rows were added to the sheet. This might indicate an issue.")
+                logger.info(f"First new job data: {job_data[0]}")
+            return new_jobs
+        except Exception as e:
+            logger.error(f"Error appending rows: {str(e)}")
+            return []
+    else:
+        logger.info("No new jobs to add")
+        return []
 
 def get_user_chat_ids():
     ensure_user_header_row()
     user_data = rate_limited_read(user_sheet)[1:]
     return [(int(row[0]), row[1].lower() == 'true') for row in user_data]
 
-def add_user_chat_id(chat_id):
+def add_user_chat_id(chat_id, debug=False):
     existing_ids = [id for id, _ in get_user_chat_ids()]
     if chat_id not in existing_ids:
-        rate_limited_append_row(user_sheet, [chat_id, 'false'])
+        rate_limited_append_row(user_sheet, [chat_id, str(debug).lower()])
+    else:
+        # Update existing user's debug status
+        user_row = next(i for i, (id, _) in enumerate(get_user_chat_ids(), start=2) if id == chat_id)
+        rate_limited_update(user_sheet, f'B{user_row}', [[str(debug).lower()]])
+
+def get_debug_user_chat_ids():
+    return [id for id, debug in get_user_chat_ids() if debug]
 
 def get_most_recent_job():
-    jobs = rate_limited_read(job_sheet)[1:]  # Skip the header row
-    if jobs:
-        most_recent = jobs[-1]  # Get the last row
-        return {
-            'title': most_recent[0],
-            'url': most_recent[1],
-            'employer': most_recent[2],
-            'location': most_recent[3],
-            'days_until_closing': most_recent[4],
-            'salary': most_recent[5],
-            'closing_date': most_recent[6],
-            'posting_date': most_recent[7],
-            'scraped_date': most_recent[8]
-        }
-    return None
+    jobs = get_all_jobs()
+    return jobs[-1] if jobs else None
 
 def ensure_user_header_row():
     if user_sheet.row_values(1) != USER_HEADER_ROW:
